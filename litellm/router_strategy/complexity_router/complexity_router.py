@@ -26,12 +26,19 @@ from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, cast
 from pydantic import BaseModel, create_model
 
 from litellm._logging import verbose_router_logger
-from litellm.constants import EMPTY_MAPPING, RETURN_RAW_MODEL_NAME_METADATA_KEY
+from litellm.constants import (
+    ADVISOR_INJECTED_PARAM,
+    ADVISOR_NATIVE_PROVIDERS,
+    EMPTY_MAPPING,
+    RETURN_RAW_MODEL_NAME_METADATA_KEY,
+)
 from litellm.integrations.custom_logger import CustomLogger
 from litellm.litellm_core_utils.core_helpers import get_metadata_variable_name_from_kwargs
 from litellm.litellm_core_utils.internal_call_metadata import forwarded_internal_call_metadata
 from litellm.litellm_core_utils.sensitive_data_masker import mask_credentials_in_payload
+from litellm.llms.anthropic.common_utils import build_advisor_tool
 from litellm.llms.base_llm.base_utils import type_to_response_format_param
+from litellm.types.llms.anthropic import ANTHROPIC_ADVISOR_TOOL_TYPE
 from litellm.types.utils import (
     AUTOROUTER_CLASSIFIER_CALL_ORIGIN,
     ModelResponse,
@@ -56,6 +63,7 @@ from .config import (
     ClassificationRubric,
     ComplexityRouterConfig,
     ComplexityTier,
+    ComplexityTierModel,
     TierDefinition,
 )
 
@@ -764,6 +772,40 @@ class _SessionAffinityPin(NamedTuple):
     tier: ComplexityTier | None
 
 
+class _AdvisorInjection(NamedTuple):
+    """Tier params for the routed decision plus the advisor outcome for its record.
+
+    `effective` is what the request carries (declared params, plus the merged tools list
+    and the injected-marker when the advisor applies); `declared` is what the operator
+    wrote on the tier entry and is what the routing decision reports, so decision logs
+    never swell with the caller's full tool list. `offered` is None when the tier has no
+    advisor config, so the decision only carries advisor fields where one was declared.
+    """
+
+    effective: Mapping[str, object]
+    declared: Mapping[str, object]
+    offered: bool | None
+    advisor_model: str | None
+
+
+def _declared_provider(deployment: Mapping[str, object]) -> str:
+    """Deployment provider read from declared config only.
+
+    Never resolves through litellm.get_llm_provider: some providers run an OAuth
+    device flow on resolution, which would block the routing hot path.
+    """
+    params: Final = deployment.get("litellm_params")
+    if not isinstance(params, Mapping):
+        return ""
+    provider: Final = params.get("custom_llm_provider")
+    if isinstance(provider, str) and provider:
+        return provider
+    model_value: Final = params.get("model")
+    if isinstance(model_value, str) and "/" in model_value:
+        return model_value.split("/", 1)[0]
+    return ""
+
+
 def _parse_session_affinity_pin(value: object) -> _SessionAffinityPin | None:
     if isinstance(value, str):
         return _SessionAffinityPin(model=value, tier=None)
@@ -1197,6 +1239,8 @@ class ComplexityRouter(CustomLogger):
         classifier_cost: float | None = None,
         conversation_continuing: bool = True,
         tier_litellm_params: Mapping[str, object] | None = None,
+        advisor_offered: bool | None = None,
+        advisor_model: str | None = None,
     ) -> StandardLoggingRoutingDecision:
         """Assemble the per-request provenance record for this router's decision.
 
@@ -1250,6 +1294,10 @@ class ComplexityRouter(CustomLogger):
             masked_tier_litellm_params: Final = mask_credentials_in_payload(tier_litellm_params)
             if isinstance(masked_tier_litellm_params, Mapping):
                 decision["tier_litellm_params"] = masked_tier_litellm_params
+        if advisor_offered is not None:
+            decision["advisor_offered"] = advisor_offered
+        if advisor_model is not None:
+            decision["advisor_model"] = advisor_model
         return decision
 
     async def aclassify(
@@ -1638,12 +1686,102 @@ class ComplexityRouter(CustomLogger):
 
         raise ValueError(f"No model configured for tier {tier_key} and no default_model set")
 
-    def _litellm_params_for_model(self, tier: ComplexityTier | str | None, model: str) -> Mapping[str, object]:
+    def _tier_entry_for_model(self, tier: ComplexityTier | str | None, model: str) -> ComplexityTierModel | None:
         if tier is None:
-            return MappingProxyType({})
+            return None
         entries: Final = self.config.tier_model_configs.get(_tier_name(tier), ())
-        entry: Final = next((candidate for candidate in entries if candidate.model_name == model), None)
+        return next((candidate for candidate in entries if candidate.model_name == model), None)
+
+    def _litellm_params_for_model(self, tier: ComplexityTier | str | None, model: str) -> Mapping[str, object]:
+        entry: Final = self._tier_entry_for_model(tier, model)
         return entry.litellm_params if entry is not None else MappingProxyType({})
+
+    def _model_group_is_all_anthropic(self, model: str) -> bool:
+        deployments: Final = self.litellm_router_instance.get_model_list(model_name=model)
+        if not deployments:
+            return False
+        return all(_declared_provider(deployment) in ADVISOR_NATIVE_PROVIDERS for deployment in deployments)
+
+    def _resolve_advisor_model(self, configured: str) -> str | None:
+        """Resolve a configured advisor model to the Anthropic model id sent on the wire.
+
+        A name serving router deployments resolves through them (a model-group name
+        forwarded verbatim is rejected upstream, LIT-6020); a name matching no
+        deployment passes through as a raw Anthropic model id. Fails closed with None
+        when any deployment behind the name is non-Anthropic, when the group's
+        deployments declare more than one distinct underlying model (configuration
+        order must never pick the consulted model), or when a wildcard survives
+        resolution: the pattern router substitutes matched segments into the model,
+        so a surviving wildcard means an exact-named group with a literal wildcard
+        model, which nothing can turn into a sendable model id.
+        """
+        stripped_configured: Final = configured.removeprefix("anthropic/")
+        deployments: Final = self.litellm_router_instance.get_model_list(model_name=configured) or ()
+        if not deployments:
+            return stripped_configured
+        if any(_declared_provider(deployment) not in ADVISOR_NATIVE_PROVIDERS for deployment in deployments):
+            return None
+        distinct_models: Final = frozenset(
+            model_value.removeprefix("anthropic/")
+            for deployment in deployments
+            if isinstance(model_value := deployment["litellm_params"].get("model"), str) and model_value
+        )
+        if len(distinct_models) != 1:
+            return None
+        resolved: Final = next(iter(distinct_models))
+        return None if "*" in resolved else resolved
+
+    def _advisor_augmented_params(
+        self,
+        tier: ComplexityTier | str | None,
+        model: str,
+        request_kwargs: Mapping[str, object],
+    ) -> _AdvisorInjection:
+        """Tier litellm_params for the routed (tier, model), advisor tool appended when it applies.
+
+        Fail-closed: the tool is injected only for a non-streaming request whose tier
+        model group resolves entirely to Anthropic deployments (the only provider that
+        orchestrates advisor_20260301 natively) and whose tools list does not already
+        carry an advisor tool. Every skip reports advisor_offered=False on the routing
+        decision instead of erroring.
+        """
+        declared: Final = self._litellm_params_for_model(tier, model)
+        entry: Final = self._tier_entry_for_model(tier, model)
+        advisor: Final = entry.advisor if entry is not None else None
+        if advisor is None:
+            return _AdvisorInjection(effective=declared, declared=declared, offered=None, advisor_model=None)
+
+        advised_tier_name: Final = _tier_name(tier) if tier is not None else ""
+
+        def _skipped(reason: str) -> _AdvisorInjection:
+            verbose_router_logger.warning(
+                "ComplexityRouter: advisor for tier=%s model=%s not offered: %s", advised_tier_name, model, reason
+            )
+            return _AdvisorInjection(effective=declared, declared=declared, offered=False, advisor_model=None)
+
+        if request_kwargs.get("stream"):
+            return _skipped("streaming requests are not advised (response strip is non-streaming only)")
+        declared_tools: Final = declared.get("tools")
+        base_tools: Final = declared_tools if declared_tools is not None else request_kwargs.get("tools")
+        if base_tools is not None and not isinstance(base_tools, list):
+            return _skipped("request tools is not a list")
+        if isinstance(base_tools, list) and any(
+            isinstance(tool, dict) and tool.get("type") == ANTHROPIC_ADVISOR_TOOL_TYPE for tool in base_tools
+        ):
+            return _skipped("an advisor tool is already present on the request")
+        if not self._model_group_is_all_anthropic(model):
+            return _skipped("tier model group does not resolve to Anthropic deployments only")
+        advisor_model: Final = self._resolve_advisor_model(advisor.model)
+        if advisor_model is None:
+            return _skipped(f"advisor model {advisor.model!r} does not resolve to exactly one Anthropic model")
+        advisor_tool: Final = build_advisor_tool(
+            model=advisor_model, max_uses=advisor.max_uses, caching=advisor.caching
+        )
+        merged_tools: Final = (
+            [*base_tools, advisor_tool] if isinstance(base_tools, list) else [advisor_tool]
+        )  # mutable-ok: request tools stays a JSON list transforms iterate and copy
+        effective: Final = MappingProxyType({**declared, "tools": merged_tools, ADVISOR_INJECTED_PARAM: True})
+        return _AdvisorInjection(effective=effective, declared=declared, offered=True, advisor_model=advisor_model)
 
     @staticmethod
     def _pick_from_tier_value(model: str | list[str], tier_key: str) -> str:
@@ -2365,13 +2503,15 @@ class ComplexityRouter(CustomLogger):
                         "ComplexityRouter: routing decision cause=%s, routed_model=%s", cause, routed_model
                     )
                     routed_pin_tier: Final = self._tier_for_model(routed_model) if plan_floored else resolved_pin_tier
-                    session_tier_litellm_params: Final = self._litellm_params_for_model(routed_pin_tier, routed_model)
+                    session_advised: Final = self._advisor_augmented_params(
+                        routed_pin_tier, routed_model, request_kwargs
+                    )
                     has_original_messages: Final = messages is not None and len(messages) > 0
                     return self._with_session_deployment_affinity(
                         PreRoutingHookResponse(
                             model=routed_model,
                             messages=messages if has_original_messages else None,
-                            litellm_params=session_tier_litellm_params,
+                            litellm_params=session_advised.effective,
                             routing_decision=self._build_routing_decision(
                                 routed_model=routed_model,
                                 cause=cause,
@@ -2380,7 +2520,9 @@ class ComplexityRouter(CustomLogger):
                                 escalation_keyword=pin_escalation_keyword,
                                 escalated=escalated,
                                 conversation_continuing=conversation_continuing,
-                                tier_litellm_params=session_tier_litellm_params,
+                                tier_litellm_params=session_advised.declared,
+                                advisor_offered=session_advised.offered,
+                                advisor_model=session_advised.advisor_model,
                             ),
                         )
                     )
@@ -2499,9 +2641,11 @@ class ComplexityRouter(CustomLogger):
                 _tier_name(plan_floor),
                 routed_model,
             )
+            plan_advised: Final = self._advisor_augmented_params(plan_floor, routed_model, request_kwargs)
             return PreRoutingHookResponse(
                 model=routed_model,
                 messages=messages if has_original_messages else None,
+                litellm_params=plan_advised.effective,
                 routing_decision=self._build_routing_decision(
                     routed_model=routed_model,
                     conversation_continuing=conversation_continuing,
@@ -2510,6 +2654,9 @@ class ComplexityRouter(CustomLogger):
                     matched_keyword=plan_mode_sentinel,
                     escalation_keyword=escalation_keyword,
                     escalated=False,
+                    tier_litellm_params=plan_advised.declared,
+                    advisor_offered=plan_advised.offered,
+                    advisor_model=plan_advised.advisor_model,
                 ),
             )
 
@@ -2524,7 +2671,7 @@ class ComplexityRouter(CustomLogger):
             )
             keyword_plan_floored: Final = routed_tier != escalated_tier
             routed_model = await self._pick_model_for_tier(routed_tier, messages, resolved_messages, request_kwargs)
-            keyword_tier_litellm_params: Final = self._litellm_params_for_model(routed_tier, routed_model)
+            keyword_advised: Final = self._advisor_augmented_params(routed_tier, routed_model, request_kwargs)
             keyword_cause: Final[RoutingDecisionCause] = (
                 "plan_mode"
                 if keyword_plan_floored
@@ -2540,7 +2687,7 @@ class ComplexityRouter(CustomLogger):
             return PreRoutingHookResponse(
                 model=routed_model,
                 messages=messages if has_original_messages else None,
-                litellm_params=keyword_tier_litellm_params,
+                litellm_params=keyword_advised.effective,
                 routing_decision=self._build_routing_decision(
                     routed_model=routed_model,
                     conversation_continuing=conversation_continuing,
@@ -2549,7 +2696,9 @@ class ComplexityRouter(CustomLogger):
                     matched_keyword=plan_mode_sentinel if keyword_plan_floored else override.matched_keyword,
                     escalation_keyword=escalation_keyword,
                     escalated=keyword_escalated,
-                    tier_litellm_params=keyword_tier_litellm_params,
+                    tier_litellm_params=keyword_advised.declared,
+                    advisor_offered=keyword_advised.offered,
+                    advisor_model=keyword_advised.advisor_model,
                 ),
             )
 
@@ -2649,7 +2798,7 @@ class ComplexityRouter(CustomLogger):
                 routed_model,
             )
 
-        tier_litellm_params: Final = self._litellm_params_for_model(tier, routed_model)
+        classified_advised: Final = self._advisor_augmented_params(tier, routed_model, request_kwargs)
         classifier_model: Final = (
             self.config.classifier_llm_config.model
             if outcome.cause == "llm_classifier" and self.config.classifier_llm_config is not None
@@ -2678,7 +2827,7 @@ class ComplexityRouter(CustomLogger):
         return PreRoutingHookResponse(
             model=routed_model,
             messages=messages if has_original_messages else None,
-            litellm_params=tier_litellm_params,
+            litellm_params=classified_advised.effective,
             routing_decision=self._build_routing_decision(
                 routed_model=routed_model,
                 conversation_continuing=conversation_continuing,
@@ -2691,6 +2840,8 @@ class ComplexityRouter(CustomLogger):
                 escalated=escalated,
                 classifier_model=classifier_model,
                 classifier_cost=outcome.classifier_cost,
-                tier_litellm_params=tier_litellm_params,
+                tier_litellm_params=classified_advised.declared,
+                advisor_offered=classified_advised.offered,
+                advisor_model=classified_advised.advisor_model,
             ),
         )

@@ -184,10 +184,36 @@ class ReminderMarkerPair(BaseModel):
         return self
 
 
+class AdvisorConfig(BaseModel):
+    """Advisor pairing for a tier: the executor consults this model via Anthropic's advisor tool.
+
+    `extra="forbid"` keeps the surface to routing intent only: credentials or endpoints
+    (api_key, api_base) are deliberately not configurable here.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    model: str = Field(min_length=1, description="Router model_name or provider model id to consult")
+    max_uses: int | None = Field(default=None, ge=1, description="Consult budget per request")
+    caching: Mapping[str, object] | None = Field(default=None, description="Advisor-side cache block, sent verbatim")
+
+    @field_validator("caching", mode="before")
+    @classmethod
+    def _freeze_caching(cls, value: Mapping[str, object] | None) -> Mapping[str, object] | None:
+        return None if value is None else MappingProxyType(dict(value))
+
+    @field_serializer("caching")
+    def _serialize_caching(self, value: Mapping[str, object] | None) -> Mapping[str, object] | None:
+        return (
+            None if value is None else dict(value)
+        )  # mutable-ok: Pydantic JSON serialization needs a concrete mapping
+
+
 class ComplexityTierModel(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     model_name: str
+    advisor: AdvisorConfig | None = None
     litellm_params: Annotated[Mapping[str, object], SkipValidation()] = Field(
         default_factory=lambda: MappingProxyType({})
     )
@@ -931,10 +957,10 @@ class ComplexityRouterConfig(BaseModel):
         normalized_tiers: Final = MappingProxyType(
             {tier: normalized for tier, (normalized, _) in normalized_entries.items()}
         )
-        incoming_params: Final = (
+        incoming_entries: Final = (
             MappingProxyType(
                 {
-                    (tier, entry.model_name): entry.litellm_params
+                    (tier, entry.model_name): entry
                     for tier, entries in existing_configs.items()
                     for entry in (ComplexityTierModel.model_validate(item) for item in entries)
                 }
@@ -944,18 +970,9 @@ class ComplexityRouterConfig(BaseModel):
         )
         tier_model_configs: Final = MappingProxyType(
             {
-                tier: tuple(
-                    entry.model_copy(
-                        update=MappingProxyType(
-                            {
-                                "litellm_params": incoming_params.get((tier, entry.model_name), entry.litellm_params),
-                            }
-                        )
-                    )
-                    for entry in entries
-                )
+                tier: tuple(incoming_entries.get((tier, entry.model_name), entry) for entry in entries)
                 for tier, (_, entries) in normalized_entries.items()
-                if any(entry.litellm_params for entry in entries)
+                if any(entry.litellm_params or entry.advisor for entry in entries)
                 or (isinstance(existing_configs, dict) and tier in existing_configs)
             }
         )

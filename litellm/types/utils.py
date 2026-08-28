@@ -2884,6 +2884,8 @@ class StandardLoggingRoutingDecision(TypedDict, total=False):
     savings_baseline_model: str
     savings_baseline_deployment_id: str
     tier_litellm_params: Mapping[str, object]  # writable-ok: Pydantic warns on ReadOnly TypedDict fields
+    advisor_offered: bool  # writable-ok: Pydantic warns on ReadOnly TypedDict fields
+    advisor_model: str  # writable-ok: Pydantic warns on ReadOnly TypedDict fields
 
 
 # Fields whose values quote the caller's prompt. Dropped when an operator turns message
@@ -2910,6 +2912,8 @@ DERIVED_ROUTING_DECISION_FIELDS: Final[frozenset[str]] = frozenset(
         "savings_baseline_model",
         "savings_baseline_deployment_id",
         "tier_litellm_params",
+        "advisor_offered",
+        "advisor_model",
     }
 )
 
@@ -3500,6 +3504,7 @@ agentic_loop_internal_litellm_params: Final = [
     "_code_interpreter_interception_converted_stream",
     "_websearch_interception_emit_native_blocks",
     "_websearch_interception_converted_stream",
+    "_advisor_injected_by_router",
 ]
 
 # Proxy-owned callback credentials, stamped from admin-configured team/key callback

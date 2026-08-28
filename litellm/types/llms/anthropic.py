@@ -564,9 +564,9 @@ class CompactionBlock(TypedDict, total=False):
 
 
 class UsageIteration(TypedDict, total=False):
-    """One sampling iteration's token usage (compact_20260112)."""
+    """One sampling iteration's token usage (compact_20260112, advisor-tool-2026-03-01)."""
 
-    type: Required[Literal["compaction", "message"]]
+    type: Required[ReadOnly[Literal["compaction", "message", "advisor_message"]]]
     input_tokens: int
     output_tokens: int
 
